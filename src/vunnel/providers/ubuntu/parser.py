@@ -42,7 +42,7 @@ _cve_filename_regex = re.compile("CVE-[0-9]+-[0-9]+")
 patch_states = {
     "DNE": False,  # Does Not Exist, the package is does not exist in a particular ubuntu release
     "needs-triage": True,  # Not yet determined if CVE affects package, consider all versions vulnerable until determination is made
-    "ignored": False,  # CVE does not affect the package or no updates (e.g. end-of-life) (NOTE: should still report?)
+    "ignored": True,  # Package is vulnerable but won't be fixed (e.g. end-of-life, no viable solution)
     "not-affected": False,  # The package is related to the issue, but not affected by it.
     "needed": True,  # Package is vuln and needs a fix. No version yet.
     "released": True,  # The package is affected and a fix has been released with the given version.
@@ -91,6 +91,7 @@ ubuntu_version_names = {
     "oracular": "24.10",
     "plucky": "25.04",
     "questing": "25.10",
+    "resolute": "26.04",
 }
 
 # driver workspace
@@ -505,6 +506,28 @@ def map_parsed(parsed_cve: CVEFile, fixdater: fixdate.Finder, logger: logging.Lo
         logger.error(f"could not find a Name for parsed cve: {asdict(parsed_cve)}")
         return []
 
+    # Build a set of (bare_codename, package) pairs where an ESM variant confirms the
+    # package is not affected. When the main (bare codename) entry is "needs-triage",
+    # we can infer that the package is also not affected on the base release, avoiding
+    # false-positive match-all constraints in grype.
+    #
+    # We only consider entries where the version field is NOT a version string (i.e. it's
+    # a textual reason like "code not present" or empty). Entries with version strings like
+    # "5.4.0-1005.5" mean "fixed at this version" — older versions may still be vulnerable.
+    _esm_prefixes = ("esm-apps/", "esm-infra/", "esm-infra-legacy/")
+    esm_not_affected = set()
+    for ip in parsed_cve.ignored_patches:
+        if ip.status == "not-affected":
+            # Skip entries where the version field looks like an actual package version —
+            # those indicate a fix version, not a blanket "not affected" determination.
+            if ip.version and ip.version[:1].isdigit():
+                continue
+            for prefix in _esm_prefixes:
+                if ip.distro.startswith(prefix):
+                    bare = ip.distro[len(prefix) :]
+                    esm_not_affected.add((bare, ip.package))
+                    break
+
     for p in parsed_cve.patches:
         namespace_name = map_namespace(p.distro)
 
@@ -534,10 +557,39 @@ def map_parsed(parsed_cve: CVEFile, fixdater: fixdate.Finder, logger: logging.Lo
             r.NamespaceName = namespace_name
             vulns[namespace_name] = r
 
+        # Emit an explicit "not affected" FixedIn (version "0") so downstream consumers
+        # can distinguish "confirmed not affected" from "no data available".
+        if p.status == "not-affected":
+            pkg = FixedIn()
+            pkg.Name = p.package
+            pkg.Version = "0"
+            pkg.VendorAdvisory = {"NoAdvisory": False}
+            pkg.VersionFormat = "dpkg"
+            pkg.NamespaceName = namespace_name
+            r.FixedIn.append(pkg)
+            continue
+
         # If the patch status is one we care about, make the FixedIn record, else skip it but create CVE records
         # We currently want to mark end-of-support records with no previously known fix as vulnerable, hence the
         # or check_merge step here.
         if check_state(p.status) or check_merge(p):
+            # If the patch is needs-triage but a corresponding ESM entry confirms
+            # the package is not affected, emit an explicit "not affected" FixedIn
+            # (version "0") instead of the match-all constraint that needs-triage
+            # would normally produce.
+            if p.status == "needs-triage" and (p.distro, p.package) in esm_not_affected:
+                logger.debug(
+                    f"emitting not-affected for {parsed_cve.name} {p.distro}/{p.package}: ESM variant confirms not-affected",
+                )
+                pkg = FixedIn()
+                pkg.Name = p.package
+                pkg.Version = "0"
+                pkg.VendorAdvisory = {"NoAdvisory": False}
+                pkg.VersionFormat = "dpkg"
+                pkg.NamespaceName = namespace_name
+                r.FixedIn.append(pkg)
+                continue
+
             pkg = FixedIn()
             pkg.Name = p.package
 

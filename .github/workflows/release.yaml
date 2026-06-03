@@ -1,119 +1,71 @@
 name: "Release"
+
+permissions: {}
+
+# there should never be two releases in progress at the same time
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
       version:
         description: tag the latest commit on main with the given version (prefixed with v)
         required: true
-      bypassQualityGate:
-        description: bypass the quality gate check
-        required: false
+      skip-checks:
+        description: skip the check gate that verifies required checks have passed on main
+        type: boolean
         default: false
-
-permissions:
-  contents: read
-
 jobs:
-  quality-gate:
-    environment: release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
-        with:
-          persist-credentials: false
+  version-available:
+    uses: anchore/workflows/.github/workflows/check-version-available.yaml@c8124d07eda64dc19b5eecb9ffd2ad4643c0aae4 # v0.7.1
+    permissions:
+      contents: read # for reading latest tags
+    with:
+      version: ${{ github.event.inputs.version }}
 
-      - name: Check if tag already exists
-        # note: this will fail if the tag already exists
-        env:
-          VERSION: ${{ github.event.inputs.version }}
-        run: |
-          # Validate version format
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Error: Version must match pattern v*.*.* (e.g., v1.2.3)"
-            exit 1
-          fi
-          git tag "$VERSION"
-
-      # we don't want to release commits that have been pushed and tagged, but not necessarily merged onto main
-      - name: Ensure tagged commit is on main
-        run: |
-          echo "Tag: ${GITHUB_REF##*/}"
-          git fetch origin main
-          git merge-base --is-ancestor ${GITHUB_REF##*/} origin/main && echo "${GITHUB_REF##*/} is a commit on main!"
-
-      - name: Check static analysis results
-        uses: fountainhead/action-wait-for-check@5a908a24814494009c4bb27c242ea38c93c593be #v1.1.1
-        id: static-analysis
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # This check name is defined as the github action job name (in .github/workflows/validations.yaml)
-          checkName: "Static Analysis"
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-      - name: Check test results
-        uses: fountainhead/action-wait-for-check@5a908a24814494009c4bb27c242ea38c93c593be #v1.1.1
-        id: test
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # This check name is defined as the github action job name (in .github/workflows/validations.yaml)
-          checkName: "Test Gate"
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-      - name: Check nightly quality gate results
-        uses: fountainhead/action-wait-for-check@5a908a24814494009c4bb27c242ea38c93c593be #v1.2.0
-        id: nightly-quality-gate
-        if: ${{ github.event.inputs.bypassQualityGate != 'true' }}
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # This check name is defined as the github action job name (in .github/workflows/nightly-quality-gate.yaml)
-          checkName: "Nightly-Quality-Gate"
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          # If there is no result in 10 seconds, assume it hasn't run yet
-          timeoutSeconds: 10
-          intervalSeconds: 3
-
-      - name: Release quality gate
-        if: steps.static-analysis.conclusion != 'success' || steps.test.conclusion != 'success' || (steps.nightly-quality-gate.conclusion != 'success' && steps.nightly-quality-gate.conclusion != 'skipped')
-        env:
-          STATIC_ANALYSIS_STATUS: ${{ steps.static-analysis.conclusion }}
-          TEST_STATUS: ${{ steps.test.conclusion }}
-          QUALITY_GATE_STATUS: ${{ steps.nightly-quality-gate.conclusion }}
-        run: |
-          echo "Static Analysis Status: $STATIC_ANALYSIS_STATUS"
-          echo "Test Status: $TEST_STATUS"
-          echo "Nightly Quality Gate Status: $QUALITY_GATE_STATUS"
-          false
+  check-gate:
+    # only run the gate when checks have not been explicitly skipped
+    if: ${{ !inputs.skip-checks }}
+    permissions:
+      checks: read # required for getting the status of specific check names
+      contents: read # needed for using the wait-for-check action upstream
+    uses: anchore/workflows/.github/workflows/check-gate.yaml@c8124d07eda64dc19b5eecb9ffd2ad4643c0aae4 # v0.7.1
+    with:
+      # these are checks that should be run on pull-request and merges to main.
+      # we do NOT want to kick off a release if these have not been verified on main.
+      # Please see the validations.yaml and nightly-quality-gate.yaml workflows for the names that should be used here.
+      checks: '["Static Analysis", "Test Gate", "Publish Pre-Prod"]'
 
   tag:
-    needs:
-      - quality-gate
+    needs: [check-gate, version-available]
+    # run even when check-gate is skipped, but never when version-available
+    # failed/was skipped, nor when check-gate failed or was cancelled. note:
+    # always() disables the implicit success() gate on ALL needs, so the
+    # version-available requirement must be re-asserted explicitly here.
+    if: >-
+      ${{ always()
+          && needs.version-available.result == 'success'
+          && !contains(fromJSON('["failure", "cancelled"]'), needs.check-gate.result) }}
     runs-on: ubuntu-latest
+    # the release environment exposes DEPLOY_KEY, the SSH key authorized to push tags to this repo.
+    # GITHUB_TOKEN cannot push to branch-protected refs, so we authenticate via deploy key instead.
+    environment: release
     permissions:
-      contents: write
-      packages: write
-      issues: read
-      pull-requests: read
+      contents: read
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           # in order to properly resolve the version from git
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Tag release
-        env:
-          VERSION: ${{ github.event.inputs.version }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Validate version format
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Error: Version must match pattern v*.*.* (e.g., v1.2.3)"
-            exit 1
-          fi
-          git config --global user.name "anchoreci"
-          git config --global user.email "anchoreci@users.noreply.github.com"
-          git tag -a "$VERSION" -m "Release $VERSION"
-          git push origin --tags
+        uses: anchore/workflows/.github/actions/create-tag-via-deploy-key@c8124d07eda64dc19b5eecb9ffd2ad4643c0aae4 # v0.7.1
+        with:
+          tag: ${{ github.event.inputs.version }}
+          deploy-key: ${{ secrets.DEPLOY_KEY }}
 
   release-pypi:
     needs:
@@ -126,7 +78,7 @@ jobs:
       # required to authenticate with PyPI via OIDC token
       id-token: write
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
           # in order to properly resolve the version from git
           fetch-depth: 0
@@ -147,7 +99,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
           # in order to properly resolve the version from git
           fetch-depth: 0
@@ -163,24 +115,6 @@ jobs:
         run: |
           echo "$GITHUB_TOKEN" | .tool/crane auth login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           echo "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-
-      - name: Wait for preprod image to be published
-        uses: fountainhead/action-wait-for-check@5a908a24814494009c4bb27c242ea38c93c593be #v1.1.1
-        id: wait-for-preprod
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # This check name is defined as the github action job name (in .github/workflows/validations.yaml)
-          checkName: "Publish-PreProd"
-          ref: ${{ github.sha }}
-
-      - name: Verify preprod publish succeeded
-        if: steps.wait-for-preprod.outputs.conclusion != 'success'
-        env:
-          PREPROD_STATUS: ${{ steps.wait-for-preprod.outputs.conclusion }}
-        run: |
-          echo "Publish-PreProd status: $PREPROD_STATUS"
-          echo "Cannot promote to release without a successful preprod image"
-          exit 1
 
       - name: Promote commit image to release
         run: |
@@ -198,7 +132,7 @@ jobs:
       issues: read
       pull-requests: read
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
           # in order to properly resolve the version from git
           fetch-depth: 0
