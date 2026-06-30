@@ -1,9 +1,9 @@
 """RapidFort security advisories provider.
 
 Ingests vulnerability data from the RapidFort security-advisories GitHub repo
-for Ubuntu, Alpine, Red Hat, and Oracle Linux. Used when scanning RapidFort-curated
-images (identified via maintainer metadata) to apply RapidFort-specific advisory
-and version checks.
+for Ubuntu, Debian, Alpine, Red Hat, and Oracle Linux. Used when scanning
+RapidFort-curated images (identified via maintainer metadata) to apply
+RapidFort-specific advisory and version checks.
 """
 
 from __future__ import annotations
