@@ -1,7 +1,7 @@
 """RapidFort security advisories parser.
 
 Reads RapidFort advisory data and normalizes to vunnel OSSchema format.
-Supports Ubuntu (dpkg), Alpine (apk), and Red Hat (rpm).
+Supports Ubuntu (dpkg), Alpine (apk), Red Hat (rpm), and Oracle Linux (rpm).
 
 Supports two input formats:
 1. Vuln-list format: {os}/{version}/{package}.json with package_name, distro_version, advisories
@@ -32,13 +32,14 @@ namespace = "rapidfort"
 default_repo_url = "https://github.com/rapidfort/security-advisories.git"
 repo_branch = "main"
 repo_os_path = "OS"  # OS/{osName}/{package}.json (source format)
-default_supported_oses = ("ubuntu", "alpine", "redhat")
+default_supported_oses = ("ubuntu", "alpine", "redhat", "oracle")
 
 # Version format per base OS
 version_formats = {
     "ubuntu": "dpkg",
     "alpine": "apk",
     "redhat": "rpm",
+    "oracle": "rpm",
 }
 
 
