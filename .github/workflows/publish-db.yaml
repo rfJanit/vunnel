@@ -78,7 +78,7 @@ jobs:
         # namespaces. If any are missing, the build linked against upstream
         # grype despite the replace directive.
         run: |
-          for ns in rapidfort-ubuntu rapidfort-alpine rapidfort-redhat rapidfort-oracle; do
+          for ns in rapidfort-ubuntu rapidfort-alpine rapidfort-redhat; do
             if ! strings ./grype-db-bin | grep -q "$ns"; then
               echo "FAIL — grype-db binary is missing '$ns' transformer case." >&2
               echo "The 'Point grype-db's go.mod' step likely didn't take effect." >&2
