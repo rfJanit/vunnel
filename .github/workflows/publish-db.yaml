@@ -47,9 +47,15 @@ jobs:
         with:
           go-version-file: grype/go.mod   # match grype's Go version
 
-      - name: Install vunnel (editable)
+      - name: Install vunnel into venv at known location
         working-directory: vunnel
-        run: uv sync --all-extras && uv pip install -e .
+        # Explicitly create the venv at ./.venv rather than trusting where
+        # `uv sync` chooses to put it — the setup-uv action or a runner-image
+        # quirk can silently redirect via UV_PROJECT_ENVIRONMENT, and then a
+        # hardcoded PATH addition below would point at a nonexistent directory.
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python -e .
 
       - name: Point grype-db's go.mod at rfJanit/grype fork
         # CRITICAL — without this, `go build` below pulls upstream anchore/grype
@@ -114,10 +120,33 @@ jobs:
               - name: rapidfort
           build:
             schema-version: 6
-            directory: /tmp/build
+            dir: /tmp/build
           package:
             publish-base-url: https://github.com/rfJanit/grype-db-rf/releases/download
           YAML
+
+      - name: Locate vunnel binary and add to PATH for subsequent steps
+        # grype-db's `executor: local` runs `vunnel` as a subprocess and looks
+        # for it on PATH. Find the binary wherever it landed and derive PATH
+        # from that. Fail fast if not found.
+        run: |
+          vunnel_bin="$(find "$GITHUB_WORKSPACE" -type f -name vunnel -executable 2>/dev/null | head -1)"
+          if [ -z "$vunnel_bin" ]; then
+            echo "FAIL — vunnel binary not found under $GITHUB_WORKSPACE" >&2
+            echo "--- .venv dirs found:" >&2
+            find "$GITHUB_WORKSPACE" -name ".venv" -type d 2>/dev/null >&2
+            exit 1
+          fi
+          echo "Found vunnel at: $vunnel_bin"
+          dirname "$vunnel_bin" >> "$GITHUB_PATH"
+
+      - name: Sanity check — vunnel resolves on PATH
+        # $GITHUB_PATH takes effect on subsequent steps, so this is the earliest
+        # place we can prove the previous step worked. Failing here is clearer
+        # than failing later with "executable file not found in $PATH".
+        run: |
+          which vunnel
+          vunnel --version
 
       - name: Run vunnel (all providers)
         env:
