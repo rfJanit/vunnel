@@ -25,6 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: rfJanit/grype
+          ref: feat/add-rapidfort-advisories
           path: grype
 
       - uses: actions/checkout@v4
