@@ -282,6 +282,7 @@ providers:
       skip_download: false
       skip_newer_archive_check: false
       user_agent: null
+    secdb_url: https://packages.cgr.dev/chainguard/security.json
   chainguard_libraries:
     openvex_url: https://libraries.cgr.dev/openvex/v1/all.json
     request_timeout: 125
@@ -601,6 +602,7 @@ providers:
       - '11'
       - '12'
       - '15'
+      - '16'
     request_timeout: 125
     runtime:
       existing_input: keep
@@ -659,6 +661,7 @@ providers:
       skip_download: false
       skip_newer_archive_check: false
       user_agent: null
+    secdb_url: https://packages.wolfi.dev/os/security.json
 root: ./data
 """
     expected_output = expected_output.replace("$VUNNEL_VERSION", vunnel_version)

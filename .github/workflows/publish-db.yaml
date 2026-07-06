@@ -1,0 +1,194 @@
+# vunnel/.github/workflows/publish-db.yaml
+name: Publish RapidFort Grype DB
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-db
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rfJanit/vunnel
+          path: vunnel
+
+      - uses: actions/checkout@v4
+        with:
+          repository: rfJanit/grype
+          path: grype
+
+      - uses: actions/checkout@v4
+        with:
+          repository: anchore/grype-db
+          ref: main   # or pin a tag
+          path: grype-db
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: grype/go.mod   # match grype's Go version
+
+      - name: Install vunnel (editable)
+        working-directory: vunnel
+        run: uv sync --all-extras && uv pip install -e .
+
+      - name: Point grype-db's go.mod at rfJanit/grype fork
+        # CRITICAL — without this, `go build` below pulls upstream anchore/grype
+        # from proxy.golang.org, which is missing the rapidfort-* transformer
+        # cases. The resulting binary silently drops every RF advisory.
+        # See "grype-db: no fork needed, but its go.mod must be patched" in Part 0.
+        working-directory: grype-db
+        run: |
+          go mod edit -replace github.com/anchore/grype=../grype
+          go mod tidy
+
+          # Sanity check — fail fast if the replace didn't take effect:
+          resolved=$(go list -m github.com/anchore/grype)
+          echo "grype-db is linked against: $resolved"
+          case "$resolved" in
+            *"=> ../grype"*) echo "OK — replace directive is active." ;;
+            *) echo "FAIL — replace didn't stick; build would produce a broken DB." >&2; exit 1 ;;
+          esac
+
+      - name: Build grype-db (linked against ../grype fork)
+        working-directory: grype-db
+        run: go build -o ../grype-db-bin ./cmd/grype-db
+
+      - name: Confirm RF transformer cases are baked in
+        # Belt-and-suspenders: strings-grep the binary for the RF distro
+        # namespaces. If any are missing, the build linked against upstream
+        # grype despite the replace directive.
+        run: |
+          for ns in rapidfort-ubuntu rapidfort-alpine rapidfort-redhat rapidfort-oracle; do
+            if ! strings ./grype-db-bin | grep -q "$ns"; then
+              echo "FAIL — grype-db binary is missing '$ns' transformer case." >&2
+              echo "The 'Point grype-db's go.mod' step likely didn't take effect." >&2
+              exit 1
+            fi
+          done
+          echo "OK — all RF transformer namespaces present in binary."
+
+      - name: Write .grype-db.yaml
+        run: |
+          cat > /tmp/grype-db.yaml <<'YAML'
+          pull:
+            parallelism: 4
+          provider:
+            root: /tmp/vunnel-data
+            vunnel:
+              executor: local
+              env:
+                GITHUB_TOKEN: $GITHUB_TOKEN
+                NVD_API_KEY: $NVD_API_KEY
+            configs:
+              - name: alpine
+              - name: amazon
+              - name: chainguard
+              - name: debian
+              - name: mariner
+              - name: nvd
+              - name: oracle
+              - name: rhel
+              - name: sles
+              - name: ubuntu
+              - name: wolfi
+              - name: rapidfort
+          build:
+            schema-version: 6
+            directory: /tmp/build
+          package:
+            publish-base-url: https://github.com/rfJanit/grype-db-rf/releases/download
+          YAML
+
+      - name: Run vunnel (all providers)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: ./grype-db-bin -c /tmp/grype-db.yaml pull -v
+
+      - name: Build DB
+        run: ./grype-db-bin -c /tmp/grype-db.yaml build -v
+
+      - name: Package DB
+        run: ./grype-db-bin -c /tmp/grype-db.yaml package -v
+
+      - name: Publish assets to grype-db-rf v6 release
+        env:
+          # Cross-repo PAT stored on this repo — created in Part 1.2.4:
+          GH_TOKEN: ${{ secrets.GRYPE_DB_RF_RELEASE_TOKEN }}
+          RELEASE_REPO: rfJanit/grype-db-rf
+          RELEASE_TAG: v6
+        run: |
+          set -euo pipefail
+
+          # 1. Upload the archive(s) first. --clobber overwrites any same-named
+          #    asset (which shouldn't happen — filename embeds a timestamp — but
+          #    is defensive against restarted workflow runs).
+          for archive in /tmp/build/vulnerability-db_v6.*.tar.zst; do
+            echo "Uploading $(basename "$archive")…"
+            gh release upload "$RELEASE_TAG" "$archive" \
+                --clobber --repo "$RELEASE_REPO"
+          done
+
+          # 2. Upload latest.json LAST — this atomically switches clients over.
+          #    If the workflow crashes between steps 1 and 2, clients keep
+          #    seeing the previous manifest and archive. Never orphan a manifest.
+          echo "Uploading latest.json (atomic switch)…"
+          gh release upload "$RELEASE_TAG" /tmp/build/latest.json \
+              --clobber --repo "$RELEASE_REPO"
+
+          # 3. Sanity: confirm both assets are now attached to the release.
+          gh release view "$RELEASE_TAG" --repo "$RELEASE_REPO" --json assets \
+            | jq -r '.assets[] | "\(.name)\t\(.size)"' | sort
+
+      - name: Prune old archive assets (keep last N)
+        env:
+          GH_TOKEN: ${{ secrets.GRYPE_DB_RF_RELEASE_TOKEN }}
+          RELEASE_REPO: rfJanit/grype-db-rf
+          RELEASE_TAG: v6
+          KEEP: 3         # number of archives to retain in addition to the newest
+        run: |
+          set -euo pipefail
+
+          # List all vulnerability-db_*.tar.zst assets sorted by upload time,
+          # oldest first. Anything past the KEEP+1 most-recent is deleted.
+          # latest.json is left untouched (only .tar.zst matched by the pattern).
+          mapfile -t assets < <(
+            gh release view "$RELEASE_TAG" --repo "$RELEASE_REPO" --json assets \
+              | jq -r '.assets
+                       | map(select(.name | test("^vulnerability-db_v6\\..*\\.tar\\.zst$")))
+                       | sort_by(.createdAt)
+                       | .[].name'
+          )
+
+          total=${#assets[@]}
+          delete_count=$(( total - KEEP - 1 ))
+          if (( delete_count <= 0 )); then
+            echo "Only $total archives present; nothing to prune (KEEP+1 = $((KEEP+1)))."
+            exit 0
+          fi
+
+          echo "Deleting $delete_count old archive assets…"
+          for (( i=0; i<delete_count; i++ )); do
+            echo "  - ${assets[$i]}"
+            gh release delete-asset "$RELEASE_TAG" "${assets[$i]}" \
+                --repo "$RELEASE_REPO" --yes
+          done
