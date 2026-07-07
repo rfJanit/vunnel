@@ -24,7 +24,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: publish-db
+  # Group by trigger type so manual `workflow_dispatch` runs don't queue
+  # behind a scheduled cron run that's already in flight. Consequence:
+  # a `schedule` run and a `workflow_dispatch` run CAN overlap. If both
+  # reach the publish stage simultaneously, `gh release upload --clobber`
+  # can race — but that's rare in practice (staggered by 10+ minutes)
+  # and dispatches are usually one-off tests where you'd notice.
+  #
+  # Within a single trigger type (e.g. two cron ticks), runs still
+  # serialize — the older run finishes before the newer starts.
+  group: publish-db-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
