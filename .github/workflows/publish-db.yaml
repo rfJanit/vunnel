@@ -1,4 +1,18 @@
 # vunnel/.github/workflows/publish-db.yaml
+#
+# Two-job matrix pipeline:
+#   1. `pull` — one job per vunnel provider, running in parallel. Each job
+#      fetches its provider's data and uploads it as an artifact. Independent
+#      6-hour budget per provider, independent cache per provider, independent
+#      failure surface.
+#   2. `build` — waits for all `pull` matrix jobs to succeed, downloads every
+#      artifact, reassembles the vunnel-data tree, builds grype-db linked
+#      against rfJanit/grype fork, packages the DB, publishes to the v6
+#      release on rfJanit/grype-db-rf, prunes old archives.
+#
+# Wall-clock is roughly max(slowest provider) + build/publish, typically
+# 45-90 min instead of the 5-6h a sequential run would take.
+
 name: Publish RapidFort Grype DB
 
 on:
@@ -14,25 +28,33 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-push:
+  pull:
+    name: pull (${{ matrix.provider }})
     runs-on: ubuntu-latest
+    strategy:
+      # CRITICAL: without fail-fast: false, one provider crashing cancels
+      # every sibling matrix job — including any that had already spent
+      # 30-60 minutes pulling successfully.
+      fail-fast: false
+      matrix:
+        provider:
+          - alpine
+          - amazon
+          - chainguard
+          - debian
+          - mariner
+          - nvd
+          - oracle
+          - rhel
+          - sles
+          - ubuntu
+          - wolfi
+          - rapidfort
     steps:
       - uses: actions/checkout@v4
         with:
           repository: rfJanit/vunnel
           path: vunnel
-
-      - uses: actions/checkout@v4
-        with:
-          repository: rfJanit/grype
-          ref: feat/add-rapidfort-advisories
-          path: grype
-
-      - uses: actions/checkout@v4
-        with:
-          repository: anchore/grype-db
-          ref: main   # or pin a tag
-          path: grype-db
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -42,32 +64,113 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v3
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: grype/go.mod   # match grype's Go version
-
       - name: Install vunnel into venv at known location
         working-directory: vunnel
-        # Explicitly create the venv at ./.venv rather than trusting where
-        # `uv sync` chooses to put it — the setup-uv action or a runner-image
-        # quirk can silently redirect via UV_PROJECT_ENVIRONMENT, and then a
-        # hardcoded PATH addition below would point at a nonexistent directory.
         run: |
           uv venv .venv
           uv pip install --python .venv/bin/python -e .
 
+      - name: Locate vunnel binary and add to PATH for subsequent steps
+        run: |
+          vunnel_bin="$(find "$GITHUB_WORKSPACE" -type f -name vunnel -executable 2>/dev/null | head -1)"
+          if [ -z "$vunnel_bin" ]; then
+            echo "FAIL — vunnel binary not found under $GITHUB_WORKSPACE" >&2
+            find "$GITHUB_WORKSPACE" -name ".venv" -type d 2>/dev/null >&2
+            exit 1
+          fi
+          echo "Found vunnel at: $vunnel_bin"
+          dirname "$vunnel_bin" >> "$GITHUB_PATH"
+
+      - name: Sanity check — vunnel resolves on PATH
+        run: |
+          which vunnel
+          vunnel --version
+
+      - name: Sanity check — NVD_API_KEY is present
+        # Only meaningful for the nvd matrix job, but running it always is
+        # harmless for the others (they don't use the key) and keeps the
+        # workflow uniform. If NVD ever runs without a key, its job hits
+        # the 6-hour cap while every other matrix job finishes cleanly —
+        # so a targeted check on the nvd job would be equivalent.
+        if: matrix.provider == 'nvd'
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          if [ -z "${NVD_API_KEY:-}" ]; then
+            echo "FAIL — NVD_API_KEY secret is not set on this repo." >&2
+            echo "Fix: gh secret set NVD_API_KEY --repo rfJanit/vunnel" >&2
+            exit 1
+          fi
+          echo "OK — NVD_API_KEY is set (length: ${#NVD_API_KEY} chars)."
+
+      - name: Restore ${{ matrix.provider }} data cache
+        # One cache scope per provider so a slow provider (nvd, rhel) doesn't
+        # invalidate a fast one's cache when the fast one hasn't changed.
+        # Key includes github.run_id so each successful run writes a fresh
+        # entry; restore-keys falls back to the newest matching prior entry.
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/data/${{ matrix.provider }}
+          key: vunnel-data-${{ matrix.provider }}-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            vunnel-data-${{ matrix.provider }}-${{ runner.os }}-
+
+      - name: Run vunnel provider ${{ matrix.provider }}
+        # vunnel's default root is ./data — the artifact upload below picks
+        # up ./data/<provider>/. GITHUB_TOKEN is needed by providers that
+        # clone from private repos (rapidfort) or hit the GitHub API
+        # (github/GHSA). NVD_API_KEY is only used by the nvd provider but
+        # exporting it globally is harmless.
+        working-directory: ${{ github.workspace }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: vunnel run ${{ matrix.provider }}
+
+      - name: Upload ${{ matrix.provider }} data artifact
+        # Retention 1 day is enough — the build job downloads them the same
+        # run, and we don't need to keep provider-level artifacts around
+        # after the final DB has been published.
+        uses: actions/upload-artifact@v4
+        with:
+          name: vunnel-data-${{ matrix.provider }}
+          path: ${{ github.workspace }}/data/${{ matrix.provider }}/
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    name: build DB and publish
+    needs: [pull]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rfJanit/grype
+          # See CLAUDE.md / RELEASE-GUIDE-GRYPE.md — this branch has the
+          # rapidfort-* transformer cases in
+          # grype/db/v6/build/transformers/os/transform.go that main lacks.
+          ref: feat/add-rapidfort-advisories
+          path: grype
+
+      - uses: actions/checkout@v4
+        with:
+          repository: anchore/grype-db
+          ref: main
+          path: grype-db
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: grype/go.mod
+
       - name: Point grype-db's go.mod at rfJanit/grype fork
-        # CRITICAL — without this, `go build` below pulls upstream anchore/grype
-        # from proxy.golang.org, which is missing the rapidfort-* transformer
-        # cases. The resulting binary silently drops every RF advisory.
-        # See "grype-db: no fork needed, but its go.mod must be patched" in Part 0.
+        # Without this, `go build` pulls upstream anchore/grype which lacks
+        # the rapidfort-* transformer cases → RF advisories get silently
+        # dropped at build time. See RELEASE-GUIDE-GRYPE.md §0 for details.
         working-directory: grype-db
         run: |
           go mod edit -replace github.com/anchore/grype=../grype
           go mod tidy
-
-          # Sanity check — fail fast if the replace didn't take effect:
           resolved=$(go list -m github.com/anchore/grype)
           echo "grype-db is linked against: $resolved"
           case "$resolved" in
@@ -84,108 +187,55 @@ jobs:
         # namespaces. If any are missing, the build linked against upstream
         # grype despite the replace directive.
         run: |
-          for ns in rapidfort-ubuntu rapidfort-alpine rapidfort-redhat; do
+          expected="rapidfort-ubuntu rapidfort-alpine rapidfort-redhat"
+          for ns in $expected; do
             if ! strings ./grype-db-bin | grep -q "$ns"; then
               echo "FAIL — grype-db binary is missing '$ns' transformer case." >&2
-              echo "The 'Point grype-db's go.mod' step likely didn't take effect." >&2
               exit 1
             fi
           done
-          echo "OK — all RF transformer namespaces present in binary."
+          echo "OK — all expected RF transformer namespaces present in binary."
+
+      - name: Download all provider artifacts
+        # Downloads each vunnel-data-<provider> artifact into a subdirectory
+        # of /tmp/artifacts named after the artifact.
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vunnel-data-*
+          path: /tmp/artifacts
+
+      - name: Reassemble /tmp/vunnel-data/<provider>/... tree
+        # download-artifact puts each artifact in /tmp/artifacts/vunnel-data-<provider>/
+        # but grype-db expects /tmp/vunnel-data/<provider>/. Rename accordingly.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/vunnel-data
+          for dir in /tmp/artifacts/vunnel-data-*/; do
+            provider=$(basename "$dir" | sed 's/^vunnel-data-//')
+            mv "$dir" "/tmp/vunnel-data/$provider"
+          done
+          echo "--- Reassembled tree:"
+          ls -la /tmp/vunnel-data/
+          echo "--- Each provider's metadata.json timestamp:"
+          for md in /tmp/vunnel-data/*/metadata.json; do
+            [ -f "$md" ] && jq -r '"\(.provider)\t\(.timestamp)\tstale=\(.stale)"' "$md"
+          done
 
       - name: Write .grype-db.yaml
+        # Note: this config has NO `provider.vunnel:` block and NO `configs:`
+        # list. Matrix jobs already ran vunnel; this step just tells grype-db
+        # where to find the pre-computed data. `dir` (not `directory`) — see
+        # RELEASE-GUIDE-GRYPE.md §1.4 config-key trap.
         run: |
           cat > /tmp/grype-db.yaml <<'YAML'
-          pull:
-            parallelism: 4
           provider:
             root: /tmp/vunnel-data
-            vunnel:
-              executor: local
-              env:
-                GITHUB_TOKEN: $GITHUB_TOKEN
-                NVD_API_KEY: $NVD_API_KEY
-            configs:
-              - name: alpine
-              - name: amazon
-              - name: chainguard
-              - name: debian
-              - name: mariner
-              - name: nvd
-              - name: oracle
-              - name: rhel
-              - name: sles
-              - name: ubuntu
-              - name: wolfi
-              - name: rapidfort
           build:
             schema-version: 6
             dir: /tmp/build
           package:
             publish-base-url: https://github.com/rfJanit/grype-db-rf/releases/download
           YAML
-
-      - name: Locate vunnel binary and add to PATH for subsequent steps
-        # grype-db's `executor: local` runs `vunnel` as a subprocess and looks
-        # for it on PATH. Find the binary wherever it landed and derive PATH
-        # from that. Fail fast if not found.
-        run: |
-          vunnel_bin="$(find "$GITHUB_WORKSPACE" -type f -name vunnel -executable 2>/dev/null | head -1)"
-          if [ -z "$vunnel_bin" ]; then
-            echo "FAIL — vunnel binary not found under $GITHUB_WORKSPACE" >&2
-            echo "--- .venv dirs found:" >&2
-            find "$GITHUB_WORKSPACE" -name ".venv" -type d 2>/dev/null >&2
-            exit 1
-          fi
-          echo "Found vunnel at: $vunnel_bin"
-          dirname "$vunnel_bin" >> "$GITHUB_PATH"
-
-      - name: Sanity check — vunnel resolves on PATH
-        # $GITHUB_PATH takes effect on subsequent steps, so this is the earliest
-        # place we can prove the previous step worked. Failing here is clearer
-        # than failing later with "executable file not found in $PATH".
-        run: |
-          which vunnel
-          vunnel --version
-
-      - name: Sanity check — NVD_API_KEY is present
-        # Print only the LENGTH of the secret (not the value — GitHub Actions
-        # would mask it anyway, but we don't want to make a habit of echoing
-        # secrets even redacted). A length of 0 means the secret isn't set on
-        # this repo, or was set with the wrong name. Expect ~36 chars for a
-        # valid NVD API key.
-        env:
-          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-        run: |
-          if [ -z "${NVD_API_KEY:-}" ]; then
-            echo "FAIL — NVD_API_KEY secret is not set on this repo." >&2
-            echo "Fix: gh secret set NVD_API_KEY --repo rfJanit/vunnel" >&2
-            exit 1
-          fi
-          echo "OK — NVD_API_KEY is set (length: ${#NVD_API_KEY} chars)."
-
-      - name: Restore vunnel-data cache
-        # Subsequent runs restore this cache and only fetch deltas — drops
-        # total workflow runtime from ~5-6 hours to ~15-30 min. First run
-        # after this step is added will still do a full pull (nothing to
-        # restore); the cache is written at the end of the successful run.
-        uses: actions/cache@v4
-        with:
-          path: /tmp/vunnel-data
-          key: vunnel-data-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: |
-            vunnel-data-${{ runner.os }}-
-
-      - name: Run vunnel (all providers)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # NVD_API_KEY must be set as a workflow secret. Without it, NVD runs
-          # unauthenticated at 5 req/30s and takes ~4.4 hours — GitHub cancels
-          # the job at the 6-hour hard cap. Register free at:
-          #   https://nvd.nist.gov/developers/request-an-api-key
-          # Then: gh secret set NVD_API_KEY --repo rfJanit/vunnel
-          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-        run: ./grype-db-bin -c /tmp/grype-db.yaml pull -v
 
       - name: Build DB
         run: ./grype-db-bin -c /tmp/grype-db.yaml build -v
@@ -195,28 +245,26 @@ jobs:
 
       - name: Publish assets to grype-db-rf v6 release
         env:
-          # Cross-repo PAT stored on this repo — created in Part 1.2.4:
+          # Cross-repo PAT stored on this repo. Created per Part 1.2.4 of
+          # RELEASE-GUIDE-GRYPE.md — needs `repo` scope on rfJanit/grype-db-rf.
           GH_TOKEN: ${{ secrets.GRYPE_DB_RF_RELEASE_TOKEN }}
           RELEASE_REPO: rfJanit/grype-db-rf
           RELEASE_TAG: v6
         run: |
           set -euo pipefail
 
-          # 1. Upload the archive(s) first. --clobber overwrites any same-named
-          #    asset (which shouldn't happen — filename embeds a timestamp — but
-          #    is defensive against restarted workflow runs).
+          # 1. Upload archive(s) FIRST. Filename embeds a timestamp so `--clobber`
+          #    is defensive against restarted runs, not against normal writes.
           for archive in /tmp/build/vulnerability-db_v6.*.tar.zst; do
             echo "Uploading $(basename "$archive")…"
-            gh release upload "$RELEASE_TAG" "$archive" \
-                --clobber --repo "$RELEASE_REPO"
+            gh release upload "$RELEASE_TAG" "$archive" --clobber --repo "$RELEASE_REPO"
           done
 
           # 2. Upload latest.json LAST — this atomically switches clients over.
           #    If the workflow crashes between steps 1 and 2, clients keep
-          #    seeing the previous manifest and archive. Never orphan a manifest.
+          #    seeing the previous manifest+archive. Never orphan a manifest.
           echo "Uploading latest.json (atomic switch)…"
-          gh release upload "$RELEASE_TAG" /tmp/build/latest.json \
-              --clobber --repo "$RELEASE_REPO"
+          gh release upload "$RELEASE_TAG" /tmp/build/latest.json --clobber --repo "$RELEASE_REPO"
 
           # 3. Sanity: confirm both assets are now attached to the release.
           gh release view "$RELEASE_TAG" --repo "$RELEASE_REPO" --json assets \
@@ -227,7 +275,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GRYPE_DB_RF_RELEASE_TOKEN }}
           RELEASE_REPO: rfJanit/grype-db-rf
           RELEASE_TAG: v6
-          KEEP: 3         # number of archives to retain in addition to the newest
+          KEEP: 3         # archives to retain in addition to the newest
         run: |
           set -euo pipefail
 
@@ -252,6 +300,5 @@ jobs:
           echo "Deleting $delete_count old archive assets…"
           for (( i=0; i<delete_count; i++ )); do
             echo "  - ${assets[$i]}"
-            gh release delete-asset "$RELEASE_TAG" "${assets[$i]}" \
-                --repo "$RELEASE_REPO" --yes
+            gh release delete-asset "$RELEASE_TAG" "${assets[$i]}" --repo "$RELEASE_REPO" --yes
           done
