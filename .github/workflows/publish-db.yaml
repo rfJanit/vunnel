@@ -310,14 +310,40 @@ jobs:
           done
 
       - name: Write .grype-db.yaml
-        # Note: this config has NO `provider.vunnel:` block and NO `configs:`
-        # list. Matrix jobs already ran vunnel; this step just tells grype-db
-        # where to find the pre-computed data. `dir` (not `directory`) — see
-        # RELEASE-GUIDE-GRYPE.md §1.4 config-key trap.
+        # `configs:` is required even for the `build` command — grype-db uses
+        # this list to enumerate which provider workspaces under provider.root
+        # to read records from. Missing the list produces:
+        #   ERROR configure a provider via the application config or use -g
+        #         to generate a list of configs from vunnel
+        #   ERROR unable to create providers: no providers configured
+        #
+        # The `provider.vunnel:` block is intentionally omitted here — matrix
+        # jobs already ran vunnel, so grype-db doesn't need to spawn it. The
+        # `executor: docker` default that shows in debug output is irrelevant
+        # for the `build` command since no vunnel invocation happens.
+        #
+        # Keep this list in sync with the matrix.provider list at the top of
+        # the workflow. If you add a new provider to the matrix, add it here
+        # too or its data will be silently skipped in the DB build.
+        #
+        # `dir` (not `directory`) — see RELEASE-GUIDE-GRYPE.md §1.4 config-key trap.
         run: |
           cat > /tmp/grype-db.yaml <<'YAML'
           provider:
             root: /tmp/vunnel-data
+            configs:
+              - name: alpine
+              - name: amazon
+              - name: chainguard
+              - name: debian
+              - name: mariner
+              - name: nvd
+              - name: oracle
+              - name: rhel
+              - name: sles
+              - name: ubuntu
+              - name: wolfi
+              - name: rapidfort
           build:
             schema-version: 6
             dir: /tmp/build
