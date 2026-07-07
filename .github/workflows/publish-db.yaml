@@ -117,6 +117,7 @@ jobs:
           echo "OK — NVD_API_KEY is set (length: ${#NVD_API_KEY} chars)."
 
       - name: Restore ${{ matrix.provider }} data cache
+        id: cache
         # One cache scope per provider so a slow provider (nvd, rhel) doesn't
         # invalidate a fast one's cache when the fast one hasn't changed.
         # Key includes github.run_id so each successful run writes a fresh
@@ -127,6 +128,52 @@ jobs:
           key: vunnel-data-${{ matrix.provider }}-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             vunnel-data-${{ matrix.provider }}-${{ runner.os }}-
+
+      - name: Bootstrap ubuntu cache from tarball (only on cache miss)
+        # Ubuntu's `vunnel run` does a full git-history walk on a cold cache,
+        # which can take 4+ hours on GitHub's 2-core hosted runner and hit
+        # the 6-hour job cap without finishing. To avoid this, we seed the
+        # cache from a pre-computed tarball hosted as a release asset on
+        # rfJanit/grype-db-rf. See RELEASE-GUIDE-GRYPE.md §1.5 for how to
+        # refresh the tarball when it goes stale.
+        #
+        # `steps.cache.outputs.cache-hit` is 'true' only on an exact key
+        # match — restore-keys partial matches also set cache-hit to 'true'
+        # in actions/cache@v4 for restoreKeys behavior, so we check the
+        # provider dir existence as a belt-and-suspenders signal.
+        if: matrix.provider == 'ubuntu' && steps.cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -d "${{ github.workspace }}/data/ubuntu/input" ]; then
+            echo "Cache miss reported but data/ubuntu/input exists — skipping bootstrap."
+            exit 0
+          fi
+
+          echo "Cache miss for ubuntu — downloading bootstrap tarball…"
+          mkdir -p "${{ github.workspace }}/data"
+
+          # Download the bootstrap tarball via `gh` (uses GITHUB_TOKEN, works
+          # even if grype-db-rf becomes private later). Falls back to plain
+          # curl if you'd rather not use the gh CLI here.
+          gh release download bootstrap \
+              --repo rfJanit/grype-db-rf \
+              --pattern 'ubuntu-bootstrap.tar.zst' \
+              --dir /tmp/
+
+          echo "Bootstrap tarball size:"
+          ls -lh /tmp/ubuntu-bootstrap.tar.zst
+
+          echo "Extracting into data/…"
+          tar --zstd -xf /tmp/ubuntu-bootstrap.tar.zst \
+              -C "${{ github.workspace }}/data"
+
+          echo "Post-extraction check:"
+          ls -la "${{ github.workspace }}/data/ubuntu/"
+          jq '{provider, timestamp, stale}' "${{ github.workspace }}/data/ubuntu/metadata.json"
+
+          # Clean up:
+          rm /tmp/ubuntu-bootstrap.tar.zst
 
       - name: Run vunnel provider ${{ matrix.provider }}
         # vunnel's default root is ./data — the artifact upload below picks
