@@ -187,6 +187,23 @@ jobs:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: vunnel run ${{ matrix.provider }}
 
+      - name: Tar provider data before upload
+        # actions/upload-artifact@v4 walks the directory tree recursively in
+        # Node.js and blows the call stack when there are ~20k+ files.
+        # Ubuntu's ubuntu-cve-tracker workspace hits this hard ("Maximum call
+        # stack size exceeded"). Reducing the artifact to a single-file
+        # tarball sidesteps the walker entirely and is faster to upload/
+        # download too. Also applied uniformly to every matrix cell —
+        # NVD and RHEL have similar file-count profiles and would eventually
+        # hit the same bug.
+        #
+        # No compression here — actions/upload-artifact already gzip-compresses
+        # on upload (see compression-level in the with: block).
+        working-directory: ${{ github.workspace }}/data
+        run: |
+          tar -cf /tmp/vunnel-data-${{ matrix.provider }}.tar ${{ matrix.provider }}/
+          ls -lh /tmp/vunnel-data-${{ matrix.provider }}.tar
+
       - name: Upload ${{ matrix.provider }} data artifact
         # Retention 1 day is enough — the build job downloads them the same
         # run, and we don't need to keep provider-level artifacts around
@@ -194,7 +211,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vunnel-data-${{ matrix.provider }}
-          path: ${{ github.workspace }}/data/${{ matrix.provider }}/
+          path: /tmp/vunnel-data-${{ matrix.provider }}.tar
           if-no-files-found: error
           retention-days: 1
 
@@ -264,15 +281,26 @@ jobs:
           pattern: vunnel-data-*
           path: /tmp/artifacts
 
-      - name: Reassemble /tmp/vunnel-data/<provider>/... tree
-        # download-artifact puts each artifact in /tmp/artifacts/vunnel-data-<provider>/
-        # but grype-db expects /tmp/vunnel-data/<provider>/. Rename accordingly.
+      - name: Extract provider tarballs into /tmp/vunnel-data/
+        # Each artifact is now a single-file tarball (see "Tar provider data
+        # before upload" in the pull job) — extract each into /tmp/vunnel-data/
+        # to reconstitute the tree grype-db expects.
         run: |
           set -euo pipefail
           mkdir -p /tmp/vunnel-data
           for dir in /tmp/artifacts/vunnel-data-*/; do
             provider=$(basename "$dir" | sed 's/^vunnel-data-//')
-            mv "$dir" "/tmp/vunnel-data/$provider"
+            tar_file="$dir/vunnel-data-$provider.tar"
+            if [ ! -f "$tar_file" ]; then
+              echo "FAIL — expected $tar_file not found. Directory contents:" >&2
+              ls -la "$dir" >&2
+              exit 1
+            fi
+            echo "Extracting $tar_file → /tmp/vunnel-data/"
+            tar -xf "$tar_file" -C /tmp/vunnel-data/
+            # Free disk space; runners have ~14 GB and provider tarballs add up.
+            rm "$tar_file"
+            rmdir "$dir" 2>/dev/null || true
           done
           echo "--- Reassembled tree:"
           ls -la /tmp/vunnel-data/
