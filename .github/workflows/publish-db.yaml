@@ -148,9 +148,42 @@ jobs:
           which vunnel
           vunnel --version
 
+      - name: Sanity check — NVD_API_KEY is present
+        # Print only the LENGTH of the secret (not the value — GitHub Actions
+        # would mask it anyway, but we don't want to make a habit of echoing
+        # secrets even redacted). A length of 0 means the secret isn't set on
+        # this repo, or was set with the wrong name. Expect ~36 chars for a
+        # valid NVD API key.
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          if [ -z "${NVD_API_KEY:-}" ]; then
+            echo "FAIL — NVD_API_KEY secret is not set on this repo." >&2
+            echo "Fix: gh secret set NVD_API_KEY --repo rfJanit/vunnel" >&2
+            exit 1
+          fi
+          echo "OK — NVD_API_KEY is set (length: ${#NVD_API_KEY} chars)."
+
+      - name: Restore vunnel-data cache
+        # Subsequent runs restore this cache and only fetch deltas — drops
+        # total workflow runtime from ~5-6 hours to ~15-30 min. First run
+        # after this step is added will still do a full pull (nothing to
+        # restore); the cache is written at the end of the successful run.
+        uses: actions/cache@v4
+        with:
+          path: /tmp/vunnel-data
+          key: vunnel-data-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            vunnel-data-${{ runner.os }}-
+
       - name: Run vunnel (all providers)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # NVD_API_KEY must be set as a workflow secret. Without it, NVD runs
+          # unauthenticated at 5 req/30s and takes ~4.4 hours — GitHub cancels
+          # the job at the 6-hour hard cap. Register free at:
+          #   https://nvd.nist.gov/developers/request-an-api-key
+          # Then: gh secret set NVD_API_KEY --repo rfJanit/vunnel
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: ./grype-db-bin -c /tmp/grype-db.yaml pull -v
 
