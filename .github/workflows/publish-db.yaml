@@ -360,6 +360,26 @@ jobs:
             publish-base-url: https://github.com/rfJanit/grype-db-rf/releases/download
           YAML
 
+      - name: Strip macOS AppleDouble metadata files from provider workspaces
+        # When the bootstrap tarball is created on macOS, its tar includes
+        # "._*" AppleDouble resource-fork sidecar files (163 bytes each,
+        # binary macOS metadata — NOT the file's real content). Once
+        # extracted in CI, grype-db's glob-based enumeration picks up
+        # `._results.db` first (`.` sorts before letters), tries to open
+        # it as SQLite, and errors with SQLITE_NOTADB (code 26).
+        #
+        # This step deletes any `._*` files that leaked in, plus a couple
+        # of other Mac artifacts. Runs unconditionally — cheap even if
+        # nothing matches.
+        run: |
+          count=$(find /tmp/vunnel-data -type f \( -name "._*" -o -name ".DS_Store" \) 2>/dev/null | wc -l)
+          if [ "$count" -gt 0 ]; then
+            echo "Removing $count macOS metadata files:"
+            find /tmp/vunnel-data -type f \( -name "._*" -o -name ".DS_Store" \) -print -delete
+          else
+            echo "No macOS metadata files found — clean."
+          fi
+
       - name: Diagnose provider workspaces
         # Runs unconditionally to give us a full picture on every run. Cheap
         # (few seconds). If Build DB errors with SQLITE_NOTADB or similar,
