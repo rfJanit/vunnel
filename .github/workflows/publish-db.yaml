@@ -446,6 +446,55 @@ jobs:
       - name: Package DB
         run: ./grype-db-bin -c /tmp/grype-db.yaml package -v
 
+      - name: Sanitize archive filename (colons → dots) for GitHub Releases
+        # grype-db packages archives with colons in the ISO timestamp segment
+        # (e.g. `vulnerability-db_v6.1.8_2026-07-08T05:16:59Z_….tar.zst`).
+        # GitHub Releases silently replaces `:` with `.` in stored asset names
+        # (colons are illegal on Windows filesystems). grype-db's latest.json
+        # embeds the colon-based filename in .path — so clients fetching the
+        # manifest reconstruct a URL that doesn't resolve on GitHub, getting
+        # a 404 on the archive.
+        #
+        # Fix: rename the archive on disk AND rewrite latest.json's .path
+        # field so both the actual filename and the manifest reference match
+        # what GitHub will store.
+        working-directory: /tmp/build
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          echo "--- Before rename:"
+          ls -la /tmp/build/
+
+          # Rename any archive with colons in its name:
+          for f in vulnerability-db_v6.*:*.tar.zst; do
+            new="${f//:/.}"
+            if [ "$f" != "$new" ]; then
+              echo "Renaming: $f -> $new"
+              mv "$f" "$new"
+            fi
+          done
+
+          # Rewrite .path in latest.json to match:
+          if [ -f latest.json ]; then
+            original_path=$(jq -r .path latest.json)
+            sanitized_path="${original_path//:/.}"
+            if [ "$original_path" != "$sanitized_path" ]; then
+              echo "Rewriting latest.json .path: $original_path -> $sanitized_path"
+              jq --arg p "$sanitized_path" '.path = $p' latest.json > latest.json.tmp
+              mv latest.json.tmp latest.json
+            else
+              echo "latest.json .path already free of colons."
+            fi
+          else
+            echo "FAIL — /tmp/build/latest.json missing after package step." >&2
+            exit 1
+          fi
+
+          echo "--- After rename:"
+          ls -la /tmp/build/
+          echo "--- Final latest.json:"
+          jq . latest.json
+
       - name: Publish assets to grype-db-rf v6 release
         env:
           # Cross-repo PAT stored on this repo. Created per Part 1.2.4 of
