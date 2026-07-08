@@ -175,6 +175,31 @@ jobs:
           # Clean up:
           rm /tmp/ubuntu-bootstrap.tar.zst
 
+      - name: Strip macOS AppleDouble metadata files (pre-vunnel)
+        # Must happen BEFORE `vunnel run` — otherwise vunnel's write_file_listing
+        # walks results/, hashes any lingering "._*" files, and records them in
+        # the workspace checksums manifest. grype-db later validates that
+        # manifest, tries to open the "._*" file, fails.
+        #
+        # Runs unconditionally (any matrix cell). AppleDouble files can enter
+        # via (a) the ubuntu bootstrap tarball if it was created on macOS, or
+        # (b) a restored cache written by a prior polluted run. Both channels
+        # are cleaned here.
+        run: |
+          if [ -d "${{ github.workspace }}/data/${{ matrix.provider }}" ]; then
+            count=$(find "${{ github.workspace }}/data/${{ matrix.provider }}" \
+                        -type f \( -name "._*" -o -name ".DS_Store" \) 2>/dev/null | wc -l)
+            if [ "$count" -gt 0 ]; then
+              echo "Removing $count macOS metadata files from data/${{ matrix.provider }}/:"
+              find "${{ github.workspace }}/data/${{ matrix.provider }}" \
+                   -type f \( -name "._*" -o -name ".DS_Store" \) -print -delete
+            else
+              echo "No macOS metadata files found — clean."
+            fi
+          else
+            echo "data/${{ matrix.provider }}/ does not exist yet — nothing to strip."
+          fi
+
       - name: Run vunnel provider ${{ matrix.provider }}
         # vunnel's default root is ./data — the artifact upload below picks
         # up ./data/<provider>/. GITHUB_TOKEN is needed by providers that
@@ -361,16 +386,17 @@ jobs:
           YAML
 
       - name: Strip macOS AppleDouble metadata files from provider workspaces
-        # When the bootstrap tarball is created on macOS, its tar includes
-        # "._*" AppleDouble resource-fork sidecar files (163 bytes each,
-        # binary macOS metadata — NOT the file's real content). Once
-        # extracted in CI, grype-db's glob-based enumeration picks up
-        # `._results.db` first (`.` sorts before letters), tries to open
-        # it as SQLite, and errors with SQLITE_NOTADB (code 26).
+        # Belt-and-suspenders defense. The primary strip happens in the pull
+        # job before `vunnel run` so that vunnel's checksums manifest never
+        # references AppleDouble files in the first place. This step here
+        # catches any that might slip through (e.g., from a legacy artifact
+        # or an operator forcing skipped pull steps).
         #
-        # This step deletes any `._*` files that leaked in, plus a couple
-        # of other Mac artifacts. Runs unconditionally — cheap even if
-        # nothing matches.
+        # Root cause: macOS's tar embeds xattrs as "._*" sidecar files in the
+        # archive. When extracted on Linux, they land as regular 163-byte
+        # binary files. If vunnel's write_file_listing walks results/ while
+        # they're present, they get into the checksums manifest — then
+        # grype-db validates the manifest and expects those files to exist.
         run: |
           count=$(find /tmp/vunnel-data -type f \( -name "._*" -o -name ".DS_Store" \) 2>/dev/null | wc -l)
           if [ "$count" -gt 0 ]; then
