@@ -232,7 +232,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: anchore/grype-db
-          ref: main
+          # Pinning to a specific tag rather than `main` avoids surprise
+          # schema drift — grype-db's main can move ahead of what your
+          # vunnel fork produces, which surfaces as SQLITE_NOTADB (error
+          # code 26) during `grype-db build`.
+          #
+          # If Build DB fails after grype-db main has advanced, temporarily
+          # change this back to `main`, or bump to a newer known-good tag.
+          # Compatibility matrix isn't published — bisect by trying recent
+          # tags until Build DB succeeds.
+          ref: v0.54.1
           path: grype-db
 
       - name: Setup Go
@@ -350,6 +359,40 @@ jobs:
           package:
             publish-base-url: https://github.com/rfJanit/grype-db-rf/releases/download
           YAML
+
+      - name: Diagnose provider workspaces
+        # Runs unconditionally to give us a full picture on every run. Cheap
+        # (few seconds). If Build DB errors with SQLITE_NOTADB or similar,
+        # this step's output identifies which provider is at fault.
+        run: |
+          set +e
+          echo "=== Per-provider workspace summary ==="
+          for p in /tmp/vunnel-data/*/; do
+            provider=$(basename "$p")
+            echo
+            echo "--- $provider ---"
+            echo "storage strategy + schema:"
+            jq -r '{store, version, distribution_version, timestamp, schema}' "$p/metadata.json" 2>/dev/null \
+              || echo "(metadata.json missing or unparseable)"
+            echo "results/ contents:"
+            ls -la "$p/results/" 2>/dev/null | head -10 || echo "(no results/ dir)"
+            if [ -f "$p/results/results.db" ]; then
+              echo "results/results.db size + magic bytes:"
+              ls -lh "$p/results/results.db"
+              # SQLite files start with the ASCII string "SQLite format 3\000".
+              # Any other magic → the file is not SQLite.
+              head -c 16 "$p/results/results.db" | xxd | head -1
+            fi
+          done
+          echo
+          echo "=== grype-db binary version ==="
+          ./grype-db-bin version
+          echo
+          echo "=== vunnel schema version(s) present in the workspaces ==="
+          for p in /tmp/vunnel-data/*/; do
+            jq -r '"\(.provider)\tstore=\(.store)\tdistribution_version=\(.distribution_version)"' \
+              "$p/metadata.json" 2>/dev/null
+          done
 
       - name: Build DB
         run: ./grype-db-bin -c /tmp/grype-db.yaml build -v
